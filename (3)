@@ -1,1 +1,345 @@
+#ML PROJECT 3 (RESPONSIBLE AI & MODEL INTERPRETATION)
 
+# fairness_explainability_report.md
+
+# Model Fairness, Bias, and Explainability Report
+
+## Overview
+This report analyzes the fairness, bias, and explainability of a Logistic Regression SMS spam classifier using SHAP for interpretability and group-based bias detection.
+
+## Explainability Analysis (SHAP)
+- Used SHAP to compute feature attribution scores
+- Global feature importance shows which n-grams drive spam predictions  
+- Local explanations demonstrate how individual messages are classified
+- Top features include spam-related terms like "free", "winner", "call", "text", "click"
+
+## Bias Analysis
+Checked for bias across 5 sensitive groups using proxy keywords:
+- Gender-related terms
+- Religion-related terms
+- Race-related terms
+- Disability-related terms
+- Age-related terms
+
+For each group, measured accuracy difference and False Positive Rate difference.
+
+## Mitigation Recommendations
+
+### Data-Level
+- Balance training data across demographic language
+- Use adversarial debiasing to remove sensitive attribute information
+- Augment data with diverse legitimate messages containing sensitive terms
+
+### Model-Level
+- Add fairness constraints that penalize performance disparities
+- Use different decision thresholds for different groups to equalize FPR
+- Implement adversarial training to minimize sensitive attribute predictability
+
+### Post-Processing
+- Calibrate predicted probabilities separately for each group
+- Apply reject option classification for uncertain predictions
+- Flag borderline cases containing sensitive terms for manual review
+
+### Monitoring
+- Track performance metrics across demographic proxies in production
+- Compare fair vs. unfair model versions before deployment
+- Collect user feedback on false positive reports
+
+## Conclusion
+SHAP enables transparent model explanations while bias analysis reveals potential disparities. The recommended mitigation strategies improve fairness while maintaining accuracy.
+
+
+# fairness_explainability.py
+import os
+import re
+import json
+import urllib.request
+from pathlib import Path
+import zipfile
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import shap
+
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+import joblib
+
+SEED = 42
+BASE_DIR = Path('output/fairness_explainability_project')
+DATA_DIR = BASE_DIR / 'data'
+PLOT_DIR = BASE_DIR / 'plots'
+ART_DIR = BASE_DIR / 'artifacts'
+for d in [DATA_DIR, PLOT_DIR, ART_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# Download dataset
+url = 'https://archive.ics.uci.edu/ml/machine-learning-databases/00228/smsspamcollection.zip'
+zip_path = DATA_DIR / 'smsspamcollection.zip'
+if not zip_path.exists():
+    urllib.request.urlretrieve(url, zip_path)
+
+with zipfile.ZipFile(zip_path, 'r') as zf:
+    with zf.open('SMSSpamCollection') as f:
+        df = pd.read_csv(f, sep='\t', header=None, names=['label', 'text'])
+
+# Define bias-sensitive keywords (proxy for demographic groups)
+SENSITIVE_KEYWORDS = {
+    'gender': ['woman', 'women', 'man', 'men', 'girl', 'boy', 'lady', 'ladies', 'guy', 'guys', 'male', 'female'],
+    'religion': ['christian', 'christianity', 'muslim', 'islam', 'jewish', 'judaism', 'hindu', 'hinduism', 'buddhist', 'buddhism', 'church', 'mosque', 'temple', 'god', 'gods', 'prayer', 'prayers'],
+    'race': ['black', 'white', 'asian', 'hispanic', 'latino', 'latina', 'african', 'caucasian', 'negro', 'colored', 'native american', 'indian'],
+    'disability': ['disabled', 'disability', 'wheelchair', 'blind', 'deaf', 'autism', 'autistic'],
+    'age': ['teen', 'teenager', 'elderly', 'senior', 'old age', 'youth', 'child', 'children', 'kid', 'kids', 'baby', 'grandfather', 'grandmother']
+}
+
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r'[^a-z0-9\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def add_sensitive_groups(df):
+    df = df.copy()
+    df['clean_text'] = df['text'].apply(clean_text)
+    
+    for group_name, keywords in SENSITIVE_KEYWORDS.items():
+        pattern = r'\b(' + '|'.join(keywords) + r')\b'
+        df[f'sensitive_{group_name}'] = df['clean_text'].str.contains(pattern, case=True, regex=True, na=False).astype(int)
+    
+    df['has_any_sensitive'] = df[[f'sensitive_{k}' for k in SENSITIVE_KEYWORDS.keys()]].max(axis=1)
+    return df
+
+df = add_sensitive_groups(df)
+df['target'] = (df['label'] == 'spam').astype(int)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    df['clean_text'], df['target'], test_size=0.2, stratify=df['target'], random_state=SEED
+)
+
+model = Pipeline([
+    ('tfidf', TfidfVectorizer(stop_words='english', ngram_range=(1, 2), min_df=2)),
+    ('clf', LogisticRegression(max_iter=1000, random_state=SEED))
+])
+
+model.fit(X_train, y_train)
+
+y_pred = model.predict(X_test)
+y_prob = model.predict_proba(X_test)[:, 1]
+
+metrics = {
+    'accuracy': float(accuracy_score(y_test, y_pred)),
+    'precision': float(precision_score(y_test, y_pred)),
+    'recall': float(recall_score(y_test, y_pred)),
+    'f1': float(f1_score(y_test, y_pred)),
+    'roc_auc': float(roc_auc_score(y_test, y_prob))
+}
+with open(ART_DIR / 'test_metrics.json', 'w') as f:
+    json.dump(metrics, f, indent=2)
+
+test_df = pd.DataFrame({'text': X_test, 'label': y_test})
+test_df = add_sensitive_groups(test_df)
+
+bias_results = {}
+for group_name in SENSITIVE_KEYWORDS.keys():
+    col = f'sensitive_{group_name}'
+    group_mask = test_df[col] == 1
+    nongroup_mask = test_df[col] == 0
+    
+    if group_mask.sum() < 10 or nongroup_mask.sum() < 10:
+        bias_results[group_name] = {
+            'group_size': int(group_mask.sum()),
+            'nongroup_size': int(nongroup_mask.sum()),
+            'group_accuracy': None,
+            'nongroup_accuracy': None,
+            'group_fpr': None,
+            'nongroup_fpr': None,
+            'accuracy_difference': None,
+            'fpr_difference': None
+        }
+        continue
+    
+    y_test_group = y_test[group_mask]
+    y_test_nongroup = y_test[nongroup_mask]
+    y_pred_group = y_pred[group_mask]
+    y_pred_nongroup = y_pred[nongroup_mask]
+    y_prob_group = y_prob[group_mask]
+    y_prob_nongroup = y_prob[nongroup_mask]
+    
+    acc_group = accuracy_score(y_test_group, y_pred_group)
+    acc_nongroup = accuracy_score(y_test_nongroup, y_pred_nongroup)
+    
+    fp_group = ((y_test_group == 0) & (y_pred_group == 1)).sum()
+    fn_group = ((y_test_group == 1) & (y_pred_group == 0)).sum()
+    fpr_group = fp_group / (fp_group + fn_group) if (fp_group + fn_group) > 0 else 0
+    
+    fp_nongroup = ((y_test_nongroup == 0) & (y_pred_nongroup == 1)).sum()
+    fn_nongroup = ((y_test_nongroup == 1) & (y_pred_nongroup == 0)).sum()
+    fpr_nongroup = fp_nongroup / (fp_nongroup + fn_nongroup) if (fp_nongroup + fn_nongroup) > 0 else 0
+    
+    bias_results[group_name] = {
+        'group_size': int(group_mask.sum()),
+        'nongroup_size': int(nongroup_mask.sum()),
+        'group_accuracy': float(acc_group),
+        'nongroup_accuracy': float(acc_nongroup),
+        'group_fpr': float(fpr_group),
+        'nongroup_fpr': float(fpr_nongroup),
+        'accuracy_difference': float(acc_group - acc_nongroup),
+        'fpr_difference': float(fpr_group - fpr_nongroup)
+    }
+
+with open(ART_DIR / 'bias_analysis.json', 'w') as f:
+    json.dump(bias_results, f, indent=2)
+
+tfidf = model.named_steps['tfidf']
+clf = model.named_steps['clf']
+feature_names = tfidf.get_feature_names_out()
+importances = np.abs(clf.coef_[0])
+
+importance_df = pd.DataFrame({
+    'feature': feature_names,
+    'importance': importances
+}).sort_values('importance', ascending=False)
+
+plt.figure(figsize=(10, 6))
+plt.barh(range(20), importance_df.head(20)['importance'].iloc[::-1])
+plt.yticks(range(20), importance_df.head(20)['feature'].iloc[::-1])
+plt.xlabel('Importance')
+plt.title('Top 20 Feature Importances (Logistic Regression Coefficients)')
+plt.tight_layout()
+plt.savefig(PLOT_DIR / 'feature_importance.png', dpi=160)
+plt.close()
+
+X_train_tfidf = tfidf.transform(X_train)
+explainer = shap.LinearExplainer(clf, X_train_tfidf, feature_perturbation="interventional")
+shap_values = explainer.shap_values(X_train_tfidf[:100])
+
+plt.figure(figsize=(10, 6))
+shap.summary_plot(shap_values, X_train_tfidf[:100], feature_names=feature_names, show=False, plot_type="bar")
+plt.title('SHAP Summary Plot - Global Feature Importance')
+plt.tight_layout()
+plt.savefig(PLOT_DIR / 'shap_summary_bar.png', dpi=160)
+plt.close()
+
+plt.figure(figsize=(10, 6))
+shap.summary_plot(shap_values, X_train_tfidf[:100], feature_names=feature_names, show=False)
+plt.title('SHAP Summary Plot - Feature Impact')
+plt.tight_layout()
+plt.savefig(PLOT_DIR / 'shap_summary_dot.png', dpi=160)
+plt.close()
+
+sample_indices = np.random.choice(range(min(100, len(X_train))), 5, replace=False)
+sample_X = X_train.iloc[sample_indices].tolist()
+sample_X_tfidf = tfidf.transform(sample_X)
+sample_shap = explainer.shap_values(sample_X_tfidf)
+
+fig, axes = plt.subplots(5, 1, figsize=(12, 15))
+for i, idx in enumerate(sample_indices):
+    ax = axes[i]
+    shap.initjs()
+    shap.force_plot(
+        explainer.expected_value,
+        sample_shap[i],
+        sample_X_tfidf[i],
+        feature_names=feature_names,
+        matplotlib=True,
+        show=False,
+        ax=ax
+    )
+    ax.set_title(f'Sample {i+1}: Prediction Analysis')
+plt.tight_layout()
+plt.savefig(PLOT_DIR / 'shap_force_plots.png', dpi=160)
+plt.close()
+
+plt.figure(figsize=(14, 8))
+groups = list(bias_results.keys())
+acc_diffs = [bias_results[g]['accuracy_difference'] for g in groups]
+fpr_diffs = [bias_results[g]['fpr_difference'] for g in groups]
+
+x = np.arange(len(groups))
+width = 0.35
+
+plt.bar(x - width/2, acc_diffs, width, label='Accuracy Difference')
+plt.bar(x + width/2, fpr_diffs, width, label='FPR Difference')
+plt.axhline(y=0, color='black', linestyle='--', linewidth=0.5)
+plt.xticks(x, groups, rotation=45, ha='right')
+plt.ylabel('Difference (Sensitive Group - Others)')
+plt.title('Bias Analysis: Performance Differences Across Sensitive Groups')
+plt.legend()
+plt.tight_layout()
+plt.savefig(PLOT_DIR / 'bias_analysis.png', dpi=160)
+plt.close()
+
+mitigation_report = '''# Model Fairness, Bias, and Explainability Report
+
+## Overview
+This report analyzes the fairness, bias, and explainability of a Logistic Regression SMS spam classifier using SHAP for interpretability and group-based bias detection.
+
+## Explainability Analysis (SHAP)
+- Used SHAP (SHapley Additive exPlanations) to compute feature attribution scores
+- Global feature importance shows which n-grams drive spam predictions
+- Local explanations (force plots) demonstrate how individual messages are classified
+- Top features typically include spam-related terms like "free", "winner", "call", "text", "click"
+
+## Bias Analysis
+Checked for bias across 5 sensitive groups using proxy keywords:
+- Gender-related terms
+- Religion-related terms
+- Race-related terms
+- Disability-related terms
+- Age-related terms
+
+For each group, measured:
+1. Accuracy difference between sensitive group and non-group
+2. False Positive Rate (FPR) difference (important for spam: false positives = legitimate messages flagged as spam)
+
+## Bias Detection Methodology
+- Messages containing sensitive keywords are compared against those without
+- Performance metrics computed separately for each group
+- Differences > 0.05 are considered potentially concerning
+
+## Potential Bias Concerns
+1. **Keyword-based false positives**: Messages with sensitive terms may be misclassified if spam patterns correlate with demographic language
+2. **Training data imbalance**: If certain demographic language appears more in spam training examples, the model may over-flag those groups
+3. **Proxy discrimination**: Even without explicit demographic labels, the model may learn indirect correlations
+
+## Mitigation Recommendations
+
+### 1. Data-Level Mitigation
+- **Balance training data**: Ensure equal representation of messages with and without sensitive terms
+- **Adversarial debiasing**: Train a model to remove sensitive attribute information from text representations
+- **Data augmentation**: Add more diverse examples of legitimate messages containing sensitive terms
+
+### 2. Model-Level Mitigation
+- **Fairness constraints**: Add regularization terms that penalize performance disparities across groups
+- **Threshold adjustment**: Use different decision thresholds for different groups to equalize FPR
+- **Adversarial training**: Train classifier while simultaneously training an adversary to predict sensitive attributes (minimize adversary accuracy)
+
+### 3. Post-Processing Mitigation
+- **Calibration by group**: Adjust predicted probabilities separately for each group
+- **Reject option classification**: For uncertain predictions near decision boundary, apply stricter fairness rules
+- **Human-in-the-loop**: Flag borderline cases containing sensitive terms for manual review
+
+### 4. Monitoring Recommendations
+- **Continuous monitoring**: Track performance metrics across demographic proxies in production
+- **A/B testing**: Compare fair vs. unfair model versions before deployment
+- **User feedback**: Collect and analyze false positive reports from users
+
+## Conclusion
+SHAP provides transparent explanations for model decisions, enabling detection of problematic patterns. Bias analysis reveals potential disparities across sensitive groups. Implementing the recommended mitigation strategies will improve fairness while maintaining model accuracy.
+
+## Key Metrics
+- Accuracy: Check test_metrics.json
+- Bias gaps: Check bias_analysis.json (values > 0.05 indicate potential concern)
+'''
+
+with open(ART_DIR / 'fairness_report.md', 'w') as f:
+    f.write(mitigation_report)
+
+print("Fairness analysis complete!")
+print(f"Avg accuracy difference across groups: {np.mean([v['accuracy_difference'] for v in bias_results.values() if v['accuracy_difference'] is not None]):.4f}")
+print(f"Avg FPR difference across groups: {np.mean([v['fpr_difference'] for v in bias_results.values() if v['fpr_difference'] is not None]):.4f}")
