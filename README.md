@@ -1,4 +1,4 @@
-# Some-ML-Projects (DEEP LEARNING -IMAGE OR TEXT CLASSIFICATION)
+# ML PROJECT 1 (DEEP LEARNING -IMAGE OR TEXT CLASSIFICATION)
 I created a complete PyTorch transfer-learning project for a small image classifier using a CIFAR-10 subset, including the training script, inference script, dependency file, and run instructions. The project uses a pretrained ResNet-18, image augmentation, saves metrics and plots, and is structured to produce a saved model plus evaluation outputs when run in a local Python environment with PyTorch installed .
 
 
